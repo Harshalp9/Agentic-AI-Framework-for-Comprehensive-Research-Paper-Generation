@@ -8,6 +8,7 @@ PaperForge AI is a Streamlit application that helps turn a research project desc
 - Semantic Scholar literature search and source metadata collection.
 - Human review and approval of the proposed outline before drafting.
 - Citation, claim, consistency, and manuscript validation checks.
+- Optional GoHumanize polishing between formatting and final validation.
 - Optional project files and experimental CSV/JSON data as evidence.
 - DOCX, PDF, and LaTeX exports, plus downloadable Markdown and a verification report.
 
@@ -41,9 +42,20 @@ PRIMARY_LLM=mistral
 
 # Optional Semantic Scholar key (unauthenticated search is also supported)
 SEMANTIC_SCHOLAR_API_KEY=your_semantic_scholar_api_key
+
+# Optional GoHumanize Hugging Face Space (for example: username/gohumanize-demo)
+GOHUMANIZE_SPACE_ID=your-username/gohumanize-demo
+# Only needed if the Space is private
+HF_TOKEN=your_hugging_face_token
+
+# Optional Napkin AI architecture diagrams
+NAPKIN_API_KEY=your_napkin_api_token
 ```
 
 Keep `.env` private and do not commit API keys. `PRIMARY_LLM` can be set to `gemini` when `GOOGLE_API_KEY` is configured. Gemini is optional; Mistral is the default provider.
+When configured, Napkin generates an architecture/component-flow visual from the Proposed Work section during export. If Napkin is unavailable, document export continues without the diagram. Add verified numeric results and baselines to the supplied results JSON/CSV for comparison tables and charts; unsupported metrics are never fabricated.
+
+To enable final-paper humanization, set `GOHUMANIZE_SPACE_ID` to the Hugging Face owner/Space name for your Gradio Space. `HF_TOKEN` is only required for a private Space. The humanizer runs on the abstract and paper sections after formatting, sends text in requests of at most 5,000 characters, and keeps citations, equations, URLs, and code blocks intact. References are not sent to the service. If the Space is not configured or a request fails, the workflow retains the formatted text and continues to final validation. The Space's free ZeroGPU quota can limit availability; without a Space ID, humanization is skipped.
 
 ## Run
 
@@ -75,6 +87,9 @@ The application reads environment variables from `.env`:
 | `GOOGLE_API_KEY` | Enables Gemini support and fallback | Not set |
 | `PRIMARY_LLM` | Selects the primary structured-output provider (`mistral` or `gemini`) | `mistral` |
 | `SEMANTIC_SCHOLAR_API_KEY` | Authenticates Semantic Scholar search requests | Not set |
+| `NAPKIN_API_KEY` | Enables Napkin AI architecture diagram generation | Not set |
+| `GOHUMANIZE_SPACE_ID` | Enables GoHumanize via a Hugging Face Gradio Space | Not set |
+| `HF_TOKEN` | Authenticates access to a private Hugging Face Space | Not set |
 | `MAX_REVISIONS` | Maximum automated revision cycles | `2` |
 | `MISTRAL_RPS` | Mistral request rate limit | `0.2` |
 | `GEMINI_RPS` | Gemini request rate limit | `0.2` |

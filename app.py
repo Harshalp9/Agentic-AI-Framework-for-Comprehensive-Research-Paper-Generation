@@ -96,10 +96,7 @@ except Exception:  # noqa: BLE001
 # CONSTANTS
 
 
-# NOTE: the "Experimental Setup" writing stage has been removed and the old
-# "Results" / "Discussion" writing stages have been merged into a single
-# "Result & Discussion" stage. The figure/table (visualization) stages have
-# also been removed - the Writer now feeds directly into verification.
+# The Writer exposes each approved body section as a separate progress stage.
 STAGES = [
     ("supervisor", "Supervisor", "🧭"),
     ("project_understanding", "Understand", "🧠"),
@@ -112,11 +109,12 @@ STAGES = [
     ("paper_outline", "Outline", "📝"),
     ("human_approval", "Approval", "🧑‍⚖️"),
     ("introduction", "Introduction", "✍️"),
-    ("literature_review", "Lit. Review", "✍️"),
-    ("methodology", "Methodology", "✍️"),
-    ("result_and_discussion", "Result & Discussion", "✍️"),
-    ("conclusion", "Conclusion", "✍️"),
-    ("future_scope", "Future Scope", "✍️"),
+    ("motivation", "Motivation", "✍️"),
+    ("related_work", "Related Work", "✍️"),
+    ("research_gaps", "Research Gaps", "✍️"),
+    ("proposed_work", "Proposed Work", "✍️"),
+    ("results_and_discussion", "Results & Discussion", "✍️"),
+    ("conclusion_and_future_work", "Conclusion & Future Work", "✍️"),
     ("abstract", "Abstract", "✍️"),
     ("citation_verification", "Citations", "🔗"),
     ("claim_verification", "Claims", "✅"),
@@ -124,6 +122,7 @@ STAGES = [
     ("review", "Review", "🔎"),
     ("revision", "Revision", "🔁"),
     ("formatting", "Format", "🎨"),
+    ("humanizer", "Humanize", "✨"),
     ("final_validation", "Validate", "🛡️"),
     ("document_export", "Export", "📦"),
 ]
@@ -155,6 +154,7 @@ NODE_LABELS = {
     "review": "Academic review",
     "revision": "Revision",
     "formatting": "Formatting",
+    "humanizer": "Humanization",
     "final_validation": "Final validation",
     "document_export": "Document export",
 }
@@ -172,6 +172,12 @@ Setup details (folded into Result & Discussion): [hardware, hyperparameters, bas
 Evaluation metrics: [e.g. accuracy, F1, latency]
 
 Actual results: [ONLY real numbers you measured, e.g. Accuracy = 91.2%]
+
+Architecture / component flow: [components and how they interact]
+
+Mathematical model / equations: [define variables and assumptions, if relevant]
+
+Algorithm and implementation steps: [inputs, outputs, parameters, numbered steps]
 
 Limitations: [known weaknesses]
 """
@@ -343,9 +349,11 @@ def render_sidebar():
         st.markdown("**Models**")
         mistral_ok = bool(os.getenv("MISTRAL_API_KEY"))
         gemini_ok = getattr(paper, "gemini", None) is not None
+        napkin_ok = bool(os.getenv("NAPKIN_API_KEY"))
         st.markdown(
             f"Mistral: {'<span class=pf-ok>key set</span>' if mistral_ok else '<span class=pf-bad>missing</span>'}<br>"
             f"Gemini: {'<span class=pf-ok>ready</span>' if gemini_ok else '<span class=pf-bad>not configured</span>'}<br>"
+            f"Napkin diagrams: {'<span class=pf-ok>ready</span>' if napkin_ok else '<span class=pf-bad>not configured</span>'}<br>"
             f"Primary: <b>{getattr(paper, 'PRIMARY', 'mistral')}</b>",
             unsafe_allow_html=True,
         )
@@ -406,7 +414,7 @@ def view_setup():
             "Project description",
             value=ss.description_text,
             height=330,
-            placeholder="Problem, method, dataset, setup, metrics, real results, limitations...",
+            placeholder="Problem, architecture, model/equations, algorithm steps, dataset, setup, metrics, real results, limitations...",
             label_visibility="collapsed",
         )
         st.caption(
@@ -436,7 +444,7 @@ def view_setup():
                 label_visibility="collapsed",
             )
         with st.expander("IEEE author block (optional)"):
-            st.caption("Leave blank to export a title-only manuscript. Add one author per line as Name | Department | Institution | City, Country | email.")
+            st.caption("Leave blank to omit author details. Add one author per line as Name | Department | Institution | City, Country | email. Exports number each author and arrange them in three centered columns.")
             author_lines = st.text_area(
                 "Authors", value="", height=100,
                 placeholder="A. Researcher | Department of AI | Example University | Pune, India | a@example.edu",
@@ -546,6 +554,8 @@ def view_approval():
     t1, t2, t3 = st.tabs(["📝 Outline", "🎯 Research gap", "📚 Literature found"])
 
     with t1:
+        if outline.get("abstract_plan"):
+            st.markdown(f"**Abstract plan:** {outline['abstract_plan']}")
         for s in outline.get("sections", []):
             with st.expander(f"{s.get('section_number', '')} {s.get('title', '')}".strip(), expanded=False):
                 st.markdown(f"**Purpose:** {s.get('purpose', '')}")

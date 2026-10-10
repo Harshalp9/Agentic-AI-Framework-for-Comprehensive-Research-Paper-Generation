@@ -3,6 +3,8 @@ import logging
 import os
 import operator
 import re
+from datetime import date
+from pathlib import Path
 from typing import Annotated, Any, TypedDict
 
 import httpx
@@ -25,10 +27,13 @@ from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Inches, Pt
 from reportlab.lib.pagesizes import A4
+from reportlab.lib.enums import TA_CENTER
 from reportlab.lib.styles import getSampleStyleSheet
-from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer
+from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+from reportlab.platypus import Image as ReportLabImage
 
-from tools import search_semantic_scholar
+from tools import generate_napkin_visual, search_semantic_scholar
+from humanizer_client import humanize_text
 
 load_dotenv()
 
@@ -142,49 +147,55 @@ def run_agent(llm, system: str, parts: dict[str, Any], limit: int = MAX_CHARS) -
     return result.model_dump()
 
 
-# NOTE: "Experimental Setup" has been removed as a standalone section, and
-# "Results" + "Discussion" have been merged into a single "Result and
-# Discussion" section (key: result_and_discussion).
 SECTION_ORDER = [
     ("Introduction", "introduction"),
-    ("Literature Review", "literature_review"),
-    ("Methodology", "methodology"),
-    ("Result and Discussion", "result_and_discussion"),
-    ("Conclusion", "conclusion"),
-    ("Future Scope", "future_scope"),
+    ("Motivation", "motivation"),
+    ("Related Work", "related_work"),
+    ("Research Gaps", "research_gaps"),
+    ("Proposed Work", "proposed_work"),
+    ("Results and Discussion", "results_and_discussion"),
+    ("Conclusion and Future Work", "conclusion_and_future_work"),
 ]
 SECTION_KEYS = [k for _, k in SECTION_ORDER]
 
 _KEY_MAP = {
     "abstract": "abstract",
     "introduction": "introduction",
-    "literature review": "literature_review",
-    "literature_review": "literature_review",
-    "related work": "literature_review",
-    "related_work": "literature_review",
-    "background": "literature_review",
-    "methodology": "methodology",
-    "methods": "methodology",
-    "method": "methodology",
-    "materials and methods": "methodology",
-    "results": "result_and_discussion",
-    "result": "result_and_discussion",
-    "results and analysis": "result_and_discussion",
-    "discussion": "result_and_discussion",
-    "results and discussion": "result_and_discussion",
-    "result and discussion": "result_and_discussion",
-    "results_discussion": "result_and_discussion",
-    "result_and_discussion": "result_and_discussion",
-    "conclusion": "conclusion",
-    "conclusions": "conclusion",
-    "future scope": "future_scope",
-    "future work": "future_scope",
-    "future_scope": "future_scope",
+    "motivation": "motivation",
+    "literature review": "related_work",
+    "literature_review": "related_work",
+    "related work": "related_work",
+    "related_work": "related_work",
+    "background": "related_work",
+    "research gap": "research_gaps",
+    "research gaps": "research_gaps",
+    "research_gap": "research_gaps",
+    "research_gaps": "research_gaps",
+    "methodology": "proposed_work",
+    "methods": "proposed_work",
+    "method": "proposed_work",
+    "materials and methods": "proposed_work",
+    "proposed work": "proposed_work",
+    "proposed_work": "proposed_work",
+    "results": "results_and_discussion",
+    "result": "results_and_discussion",
+    "results and analysis": "results_and_discussion",
+    "discussion": "results_and_discussion",
+    "results and discussion": "results_and_discussion",
+    "result and discussion": "results_and_discussion",
+    "results_discussion": "results_and_discussion",
+    "result_and_discussion": "results_and_discussion",
+    "conclusion": "conclusion_and_future_work",
+    "conclusions": "conclusion_and_future_work",
+    "future scope": "conclusion_and_future_work",
+    "future work": "conclusion_and_future_work",
+    "conclusion and future work": "conclusion_and_future_work",
+    "conclusion_and_future_work": "conclusion_and_future_work",
 }
 
 
 def section_key(title: str) -> str:
-    """Map a section title ('3. Methodology', 'III. Methods') to a state key ('' if none)."""
+    """Map an outline section title to its manuscript state key, or '' if unsupported."""
     t = re.sub(r"^\s*([0-9]+|[ivxIVX]+)[\.\)]\s*", "", title or "").strip().lower()
     return _KEY_MAP.get(t, "")
 
@@ -277,6 +288,10 @@ class ResearchState(TypedDict, total=False):
     # Human approval
     approval_status: str
     approval_feedback: str
+    outline_review_status: str
+    outline_review_feedback: str
+    outline_review_iteration: int
+    outline_review_assessments: dict[str, str]
 
     # Writing
     completed_sections: list[str]
@@ -285,11 +300,12 @@ class ResearchState(TypedDict, total=False):
     abstract: str
     index_terms: list[str]
     introduction: str
-    literature_review: str
-    methodology: str
-    result_and_discussion: str
-    conclusion: str
-    future_scope: str
+    motivation: str
+    related_work: str
+    research_gaps: str
+    proposed_work: str
+    results_and_discussion: str
+    conclusion_and_future_work: str
     references: list[dict[str, Any]]
 
     # Verified experimental data supplied by the user
@@ -452,7 +468,9 @@ def research_planner_node(state: ResearchState) -> dict:
             "CONFIRMED FACTS": state.get("confirmed_facts", []),
             "UNCERTAIN FACTS": state.get("uncertain_facts", []),
             "MISSING INFORMATION": state.get("missing_information", []),
-            "HUMAN FEEDBACK ON PREVIOUS OUTLINE": state.get("approval_feedback", ""),
+            "FEEDBACK ON PREVIOUS OUTLINE": "\n\n".join(
+                part for part in (state.get("outline_review_feedback", ""), state.get("approval_feedback", "")) if part
+            ),
         },
     )
     return {
@@ -807,6 +825,7 @@ class OutlineSection(BaseModel):
 
 class PaperOutline(BaseModel):
     title_candidates: list[str] = Field(default_factory=list)
+    abstract_plan: str = ""
     research_problem: str = ""
     research_objectives: list[str] = Field(default_factory=list)
     research_gap: str = ""
@@ -822,22 +841,67 @@ You are the Paper Outline Agent of PaperForge AI.
 Create a detailed IEEE-style paper outline based ONLY on the project profile,
 research plan, research gap and retrieved literature. Do NOT write the sections.
 
-Produce: several title candidates, research problem, objectives, research gap,
-contribution summary, sections (with purpose, key_points, evidence_needed and
-related_sources as source_ids), and writing notes.
+Produce: several title candidates, an abstract plan, research problem,
+objectives, research gap, contribution summary, body sections (with purpose,
+key_points, evidence_needed and related_sources as source_ids), and writing
+notes. References are compiled from cited retrieved sources during export and
+must not be included as an outline section.
 
-Use EXACTLY these section titles, in this order (no numbering, no References
-section, no separate Experimental Setup section, no separate Discussion
-section):
-Introduction, Literature Review, Methodology, Result and Discussion, Conclusion,
-Future Scope.
+Use EXACTLY these section titles, in this order (no numbering, no separate
+Abstract, Title or References section in the sections list, no separate
+Experimental Setup section, no separate Discussion section, no separate Future
+Work section):
+Introduction, Motivation, Related Work, Research Gaps, Proposed Work,
+Results and Discussion, Conclusion and Future Work.
 
-- The gap must be reflected in Introduction, Literature Review and contributions.
-- Methodology only from the described project methodology.
-- Result and Discussion: state what must be reported (including any dataset,
-  setup, hardware/software or evaluation-protocol details needed as context),
-  then how those results should be interpreted against objectives, gap and
-  literature; never fabricate results.
+SECTION REQUIREMENTS
+
+- Introduction: key_points must cover, in order: context; 4-5 references
+  (related_sources) grounding the context and problem; introduction of the core
+  concept; key contributions; organization of the paper. The gap and approach
+  are mentioned only briefly here.
+
+- Motivation: key_points must cover three elements: story, use case and
+  scenario. In evidence_needed, state what project evidence, confirmed facts or
+  retrieved literature supports each element. If an element cannot be grounded,
+  mark it as illustrative/hypothetical or say the user must supply it. Keep the
+  AI angle explicit where the project is AI-based. Never invent a story, user,
+  organisation, incident or statistic.
+
+- Related Work: thematic and comparative, not paper-by-paper. Target 10-15
+  retrieved references/papers in related_sources. If fewer relevant papers were
+  retrieved, list only those and note the shortfall in writing notes. Never pad
+  with invented sources.
+
+- Research Gaps: identify the gaps in existing research, derived from the
+  approved research gap and the limitations seen in Related Work. Each gap must
+  be traceable to related_sources or the approved gap statement. Mark possible
+  gaps as possible; never claim novelty merely because a paper was not
+  retrieved. Link each gap to what Proposed Work addresses.
+
+- Proposed Work: include clearly numbered, project-relevant methodology
+  subsections, then the step-by-step algorithm/implementation. Where an
+  evidenced transformation, loss, optimizer or explicitly used metric benefits
+  from a formula, put the complete equation alone on a numbered display line
+  and follow it with a paragraph beginning "where" that defines every symbol
+  and assumption. Use consecutive equation numbers and the same formal style
+  throughout. Do not invent methods, formulas, steps or parameters; list missing
+  details as items the user must supply.
+
+- Results and Discussion: two parts. (1) Results: state what must be reported,
+  including any dataset, setup, hardware/software or evaluation-protocol
+  details needed as context. (2) Discussion: how those results should be
+  interpreted against objectives, gap and literature, including limitations.
+  Never fabricate results.
+
+- Conclusion and Future Work: two parts. (1) Conclusion: problem, approach,
+  findings, contributions, limitations; nothing new. (2) Future work:
+  evidence-based next steps and stated limitations only.
+
+CROSS-SECTION RULES
+- The gap must be reflected in Introduction, Related Work, Research Gaps,
+  Proposed Work and contributions.
+- Key contributions must be confirmed by the project plan and evidence.
 - If information is missing for a section, say the user must supply it.
 """
 
@@ -854,7 +918,9 @@ def paper_outline_node(state: ResearchState) -> dict:
             "RETRIEVED LITERATURE": literature_brief(state, 300),
             "LITERATURE MATRIX": state.get("literature_matrix", []),
             "LITERATURE SYNTHESIS": state.get("literature_synthesis", {}),
-            "HUMAN FEEDBACK ON PREVIOUS OUTLINE": state.get("approval_feedback", ""),
+            "FEEDBACK ON PREVIOUS OUTLINE": "\n\n".join(
+                part for part in (state.get("outline_review_feedback", ""), state.get("approval_feedback", "")) if part
+            ),
         },
     )
     titles = outline["title_candidates"]
@@ -869,7 +935,78 @@ def paper_outline_node(state: ResearchState) -> dict:
 
 
 
-# 7. HUMAN APPROVAL
+# 7. AI OUTLINE REVIEW
+
+
+class OutlineReview(BaseModel):
+    decision: str = Field(description="approve or reject")
+    timeliness_assessment: str = ""
+    context_assessment: str = ""
+    outline_assessment: str = ""
+    feedback_for_planner: str = ""
+
+
+outline_review_llm = structured(OutlineReview)
+
+OUTLINE_REVIEW_PROMPT = NO_INVENTION + """
+You are the iterative Outline Review Agent of PaperForge AI. Review the proposed
+research plan and paper outline before it reaches a human.
+
+Assess all three dimensions:
+1. Timeliness: whether the topic and supporting literature reflect the current
+   state of the field, using publication years and the supplied current date.
+   Do not reject solely because seminal sources are older; assess whether recent
+   sources are also needed or present.
+2. Context: whether the outline accurately reflects the project profile,
+   research problem, objectives, research gap and retrieved evidence without
+   inventing facts or claiming unsupported novelty.
+3. Outline: whether sections are coherent, sufficiently specific, follow the
+   requested IEEE structure and identify missing evidence clearly.
+
+Set decision to exactly "approve" only when the outline is suitable for human
+approval. Otherwise set it to exactly "reject" and give concrete, actionable
+feedback_for_planner so the Research Planner and outline can iterate. Be
+constructive and judge only the supplied evidence.
+"""
+
+
+def outline_review_node(state: ResearchState) -> dict:
+    print("\n--- [AI Outline Review] ---")
+    result = run_agent(
+        outline_review_llm,
+        OUTLINE_REVIEW_PROMPT,
+        {
+            "CURRENT DATE": date.today().isoformat(),
+            "PROJECT PROFILE": state.get("project_profile", {}),
+            "RESEARCH PLAN": state.get("research_plan", {}),
+            "RESEARCH GAP": state.get("research_gap", {}),
+            "RETRIEVED LITERATURE": literature_brief(state, 300),
+            "PAPER OUTLINE": state.get("paper_outline", {}),
+            "PRIOR REVIEW FEEDBACK": state.get("outline_review_feedback", ""),
+        },
+    )
+    decision = str(result.get("decision", "reject")).strip().lower()
+    if decision not in {"approve", "reject"}:
+        decision = "reject"
+    return {
+        "outline_review_status": decision,
+        "outline_review_feedback": result.get("feedback_for_planner", ""),
+        "outline_review_iteration": state.get("outline_review_iteration", 0) + 1,
+        "outline_review_assessments": {
+            "timeliness": result.get("timeliness_assessment", ""),
+            "context": result.get("context_assessment", ""),
+            "outline": result.get("outline_assessment", ""),
+        },
+    }
+
+
+def route_after_outline_review(state: ResearchState) -> str:
+    if state.get("outline_review_status", "").strip().lower() == "approve":
+        return "human_approval"
+    return "research_planner"
+
+
+# 8. HUMAN APPROVAL
 
 
 
@@ -878,10 +1015,16 @@ def human_approval_node(state: ResearchState) -> dict:
     user_response = interrupt(
         {
             "type": "paper_outline_approval",
-            "message": "Please review the generated paper outline.",
+            "message": "The AI outline review approved this outline. Please review it.",
             "title_candidates": state.get("title_candidates", []),
             "paper_outline": state.get("paper_outline", {}),
-            "instructions": "Approve to continue to the Writing Agent, or reject with feedback.",
+            "ai_review": {
+                "decision": state.get("outline_review_status", ""),
+                "iteration": state.get("outline_review_iteration", 0),
+                **state.get("outline_review_assessments", {}),
+                "feedback": state.get("outline_review_feedback", ""),
+            },
+            "instructions": "Approve to continue to the Writing Agent, or reject with feedback. AI review: " + state.get("outline_review_feedback", "No changes requested."),
         }
     )
     status = str(user_response.get("status", "rejected")).strip().lower()
@@ -922,6 +1065,19 @@ WRITER_PROMPT = NO_INVENTION + """
 You are the Writing Agent of PaperForge AI. Write ONE section of an IEEE-style
 research paper. Do NOT do final IEEE layout (a later step does that).
 
+PAPER STRUCTURE (fixed; the approved outline maps onto exactly these sections):
+  Abstract
+  I.   Introduction
+  II.  Motivation
+  III. Related Work
+  IV.  Research Gaps
+  V.   Proposed Work
+  VI.  Results and Discussion
+  VII. Conclusion and Future Work
+Write only the section you are assigned and respect its place in this order.
+Do not merge sections, add sections, or move content between them. Title
+selection and the References list are handled separately from section writing.
+
 SOURCE PRIORITY: 1) uploaded materials / actual project evidence, 2) confirmed
 project facts, 3) approved plan, 4) approved research gap, 5) retrieved literature.
 The approved outline is authoritative: follow the section purpose and key points,
@@ -935,33 +1091,104 @@ confirmed gap and never claim novelty merely because a paper was not retrieved.
 
 CITATIONS: cite ONLY retrieved papers using their source_id in square brackets,
 e.g. [SRC3] or [SRC1, SRC4]. Never invent citations, numbers, authors, DOIs.
+Reference-count targets below are TARGETS, not permission to invent: if fewer
+retrieved papers are relevant, cite only those and record the shortfall in
+unsupported_or_missing.
+
+EQUATIONS: include a formula only when it materially clarifies a method,
+transformation, loss, optimizer, algorithm step or metric that is explicitly
+described or used in the supplied project information. A canonical definition
+of an explicitly named standard metric or method is allowed, but do not imply
+that an equation proves the project implemented it. Never invent project
+parameters, values, operations or results to complete an equation. If a formula
+depends on missing details, omit it and name the missing details in
+unsupported_or_missing. Do not force equations into every subsection.
+Format formulas like a formal methodology chapter: use relevant numbered
+subsections (for example, data preprocessing, feature extraction, model
+training, and evaluation), put each complete equation on its own display line,
+and place its number at the end as (1), (2), and so on across the manuscript.
+Immediately after each equation, add a separate explanatory paragraph beginning
+"where" that defines every symbol and states any assumptions. Use a readable
+equation with actual symbols and operators (for example, x_norm = x / 255),
+never a blank line, dots, ellipses, or missing-symbol placeholders. Do not use
+LaTeX commands or Markdown math delimiters because exporters render section
+content as text. Include a formula only when its operation is evidenced or it
+is the canonical definition of an explicitly named method or metric; never
+pretend the presence of a formula proves that the project implemented it.
 
 SECTION GUIDES
-- Introduction: context -> problem -> importance -> existing approaches ->
-  limitations -> gap -> objective -> questions (if any) -> approach -> contributions.
-- Literature Review: thematic and comparative (not paper-by-paper); limitations,
-  datasets, evaluation; connect to the gap; only retrieved papers.
-- Methodology: only what the project actually describes (architecture, data,
-  preprocessing, training, setup, metrics, baselines). Do not add "standard"
-  methods that were not stated.
-- Result and Discussion: first report ONLY actual results provided (you may
-  briefly note supplied datasets, splits, hardware, software, hyperparameters,
-  baselines and evaluation protocol as context - explicitly say what was not
-  provided instead of assuming it), then interpret those actual results against
-  objectives, gap and literature; clearly mark speculation; state limitations.
-  If no results exist, write only what is supported and list the missing result
-  information in unsupported_or_missing.
-- Conclusion: problem, approach, findings, contributions, limitations, future work;
-  introduce nothing new.
-- Future Scope: evidence-based next steps and stated limitations only; do not
-  present planned work as completed work.
+
 - Abstract (written last): background, objective, method, key ACTUAL results,
   contribution, conclusion - consistent with the manuscript. Also return
-  index_terms (concise technical keywords from the paper only).
+    index_terms (concise technical keywords from the paper only). Do not add an
+    equation unless essential to identify the method; never use one as a
+    substitute for reporting actual results.
+
+- I. Introduction, in this order:
+  1. Context: the application domain and why it matters.
+  2. References: ground the context and problem with 4-5 retrieved references.
+  3. Introduce the concept: define the core concept, problem or technique the
+     paper addresses, then the problem and its importance.
+  4. Key contributions: state only contributions confirmed by the approved plan
+     and project evidence, as a short list or sentence.
+  5. Organization of the paper: one paragraph summarising what Sections II to
+     VII cover, matching the structure above.
+  Mention existing approaches and the gap only briefly here; the detailed
+  treatment belongs to Sections III and IV.
+
+- II. Motivation: explain why the work is needed through three elements:
+  1. Story: the short narrative of the problem or need that led to the work.
+  2. Use case: a concrete application where the work would be used.
+  3. Scenario: a specific situation showing the problem and how the proposed
+     work would help.
+  Ground all three in project evidence, confirmed facts or retrieved
+  literature. If an element is illustrative rather than documented, label it
+  explicitly as an illustrative or hypothetical scenario. Never present an
+  invented story, user, organisation, incident or statistic as real.
+  Keep the AI angle of the work explicit where the project is AI-based.
+
+- III. Related Work: thematic and comparative (not paper-by-paper). Target
+  10-15 retrieved references/papers. Cover methods, datasets, evaluation and
+  limitations; use only retrieved papers. Do not state the research gap
+  conclusively here; end by leading into Section IV.
+
+- IV. Research Gaps: identify the gaps in existing research, derived from the
+  approved research gap and the limitations seen in Section III. Each gap must
+  be traceable to cited literature or an approved gap statement. Mark possible
+  gaps as possible; do not claim novelty because a paper was not retrieved.
+  Link each gap to what Section V addresses.
+
+- V. Proposed Work: use clear numbered subsections for the project-specific
+  system overview, data acquisition/preparation, model or feature extraction,
+  training, and evaluation as applicable. Give each evidenced formula its own
+  numbered display line followed immediately by a "where" paragraph defining
+  all symbols, following a formal methodology-chapter style. Then describe the
+  algorithm and step-by-step implementation, including inputs, outputs and
+  parameters exactly as provided. Never invent details; list missing items in
+  unsupported_or_missing.
+
+- VI. Results and Discussion: two parts.
+  1. Results: present supplied metrics in a compact table and include
+     performance comparisons/graphs only when supported by supplied numerical
+     results and baselines. Report ONLY actual results provided (you may briefly note
+     supplied datasets, splits, hardware, software, hyperparameters, baselines
+     and evaluation protocol as context - explicitly say what was not provided
+     instead of assuming it).
+  2. Discussion: interpret those actual results against objectives, gaps and
+     literature; clearly mark speculation; state limitations.
+  If no results exist, write only what is supported and list the missing result
+  information in unsupported_or_missing.
+
+- VII. Conclusion and Future Work: two parts.
+  1. Conclusion: problem, approach, findings, contributions, limitations;
+     introduce nothing new.
+  2. Future work: evidence-based next steps and stated limitations only; do not
+     present planned work as completed work.
 
 Keep terminology, dataset names, model names, metrics and numbers consistent with
 previously written sections. Return only the section content plus schema metadata.
 """
+
 
 
 def _pending_sections(state: ResearchState) -> list[dict]:
@@ -1005,7 +1232,14 @@ def writer_node(state: ResearchState) -> dict:
         out = run_agent(
             writer_llm,
             WRITER_PROMPT,
-            {**common, "CURRENT SECTION TO WRITE": {"title": "Abstract", "purpose": "Summarise the completed paper."}},
+            {
+                **common,
+                "CURRENT SECTION TO WRITE": {
+                    "title": "Abstract",
+                    "purpose": state.get("paper_outline", {}).get("abstract_plan")
+                    or "Summarise the completed paper.",
+                },
+            },
         )
         return {
             "abstract": out["content"],
@@ -1340,12 +1574,12 @@ CONSISTENCY_VERIFICATION_PROMPT = NO_INVENTION + """
 You are the Consistency Verification Agent of PaperForge AI. VERIFICATION ONLY:
 do not rewrite the manuscript.
 
-Check internal consistency from Abstract to Conclusion: numerical values
-(accuracy, F1, dataset size, splits, counts), methodology vs the Result and
-Discussion section, dataset description, evaluation metrics, objectives,
-contributions, terminology (only when different names could mean different
-systems), the Result and Discussion section vs Conclusion, Abstract vs body,
-and citation usage.
+Check internal consistency from Abstract to Conclusion and Future Work:
+numerical values (accuracy, F1, dataset size, splits, counts), proposed work vs
+the Results and Discussion section, dataset description, evaluation metrics,
+objectives, contributions, terminology (only when different names could mean
+different systems), Results and Discussion vs Conclusion and Future Work,
+Abstract vs body, and citation usage.
 
 Only report a conflict when the statements cannot both reasonably be true or the
 difference causes real ambiguity; never flag harmless wording differences.
@@ -1441,7 +1675,7 @@ Take high/critical verification issues seriously, but do not blindly accept ever
 flagged item; judge with the evidence.
 
 Severity: low | medium | high | critical. For each issue give issue_id,
-issue_type, severity, section (e.g. "Result and Discussion"), description,
+issue_type, severity, section (e.g. "Results and Discussion"), description,
 evidence, recommendation.
 
 No meaningful issues -> issues_found=false, revision_required=false,
@@ -1518,6 +1752,8 @@ REVISION_PROMPT = NO_INVENTION + """
 You are the Revision Agent of PaperForge AI. Revise ONE section of the paper using
 the supplied verification and review feedback.
 - Fix the identified problems while preserving verified information.
+- Preserve equations, symbols, definitions and equation numbers exactly unless
+    a specific verified issue requires a correction; never invent a replacement.
 - Do not change verified experimental results and do not redesign the research.
 - Keep citations in [SRCn] form; only cite retrieved sources.
 - If an issue cannot be resolved because evidence is missing, keep the supported
@@ -1715,14 +1951,95 @@ def prepare_export(state: ResearchState) -> dict:
         for sid in order
     ]
 
+    roman = ("I", "II", "III", "IV", "V", "VI", "VII")
+    metric_rows = state.get("actual_results", {}).get("model_metrics", [])
+    if isinstance(metric_rows, list) and metric_rows and all(isinstance(row, dict) for row in metric_rows):
+        metric_keys = list(dict.fromkeys(key for row in metric_rows for key in row))
+        table_text = "Supplied model and metric comparison\n" + " | ".join(metric_keys) + "\n"
+        table_text += "\n".join(" | ".join(str(row.get(key, "")) for key in metric_keys) for row in metric_rows)
+        texts["results_and_discussion"] = (texts["results_and_discussion"] + "\n\n" + table_text).strip()
     return {
         "title": state.get("selected_title", ""),
         "abstract": sub(texts["abstract"]),
         "index_terms": state.get("index_terms", []),
-        "sections": [(t, sub(texts[k])) for t, k in SECTION_ORDER if texts[k]],
+        "sections": [
+            (roman[i], title, sub(texts[key]))
+            for i, (title, key) in enumerate(SECTION_ORDER)
+            if texts[key]
+        ],
         "references": ref_strings,
         "missing_refs": [sid for sid in order if sid not in by_id],
+        "architecture_diagram": state.get("architecture_diagram", ""),
+        "results_chart": state.get("results_chart", ""),
     }
+
+
+def generate_napkin_diagram(state: ResearchState, output_dir: str) -> str:
+    """Use the Napkin LangChain tool for an evidence-grounded architecture visual."""
+    if not os.getenv("NAPKIN_API_KEY", "").strip() or not state.get("proposed_work"):
+        return ""
+    profile = state.get("project_profile", {})
+    tool_result = generate_napkin_visual.invoke(
+        {
+            "content": (
+                f"System architecture and component flow for "
+                f"{profile.get('research_title') or 'the proposed system'}. "
+                f"Use only these described details; do not add components: "
+                f"{state.get('proposed_work', '')}"
+            ),
+            "context": (
+                "Create a clear academic architecture diagram showing only the "
+                "described components, their relationships, and system flow."
+            ),
+            "output_path": os.path.join(output_dir, "architecture_diagram.png"),
+        }
+    )
+    try:
+        result = json.loads(tool_result)
+    except (TypeError, ValueError):
+        logging.warning("Napkin visual tool returned an unreadable response.")
+        return ""
+    if result.get("ok"):
+        return result.get("path", "")
+    logging.warning("Napkin architecture diagram unavailable: %s", result.get("error", "unknown error"))
+    return ""
+
+
+def generate_results_chart(state: ResearchState, output_dir: str) -> str:
+    """Plot model/metric comparisons only when supplied results contain them."""
+    results = state.get("actual_results", {})
+    rows = results.get("model_metrics") if isinstance(results, dict) else None
+    if not isinstance(rows, list) or len(rows) < 2 or not all(isinstance(row, dict) for row in rows):
+        return ""
+    labels = [str(row.get("model") or row.get("name") or "") for row in rows]
+    if not all(labels):
+        return ""
+    metrics = [key for key in rows[0] if key not in {"model", "name"} and all(
+        isinstance(row.get(key), (int, float)) and not isinstance(row.get(key), bool) for row in rows
+    )]
+    if not metrics:
+        return ""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        figure, axis = plt.subplots(figsize=(7, 4))
+        width = 0.8 / len(metrics)
+        for index, metric in enumerate(metrics):
+            positions = [i - 0.4 + width / 2 + index * width for i in range(len(labels))]
+            axis.bar(positions, [row[metric] for row in rows], width, label=metric)
+        axis.set_xticks(range(len(labels)), labels, rotation=20, ha="right")
+        axis.set_ylabel("Supplied metric value")
+        axis.set_title("Performance comparison from supplied results")
+        axis.legend()
+        figure.tight_layout()
+        path = os.path.join(output_dir, "results_comparison.png")
+        figure.savefig(path, dpi=180)
+        plt.close(figure)
+        return path
+    except Exception as exc:  # noqa: BLE001
+        logging.warning("Could not plot supplied results: %s", exc)
+        return ""
 
 
 def render_markdown(state: ResearchState) -> str:
@@ -1734,9 +2051,8 @@ def render_markdown(state: ResearchState) -> str:
         parts.append(f"## Abstract\n\n{d['abstract']}")
     if d["index_terms"]:
         parts.append("## Keywords\n\n" + ", ".join(d["index_terms"]))
-    roman = ["I", "II", "III", "IV", "V", "VI", "VII", "VIII"]
-    for i, (title, text) in enumerate(d["sections"]):
-        parts.append(f"## {roman[i]}. {title}\n\n{text}")
+    for number, title, text in d["sections"]:
+        parts.append(f"## {number}. {title}\n\n{text}")
     parts.append("## References\n\n" + "\n".join(f"[{i}] {r}" for i, r in enumerate(d["references"], 1)))
     return "\n\n".join(parts)
 
@@ -1751,11 +2067,12 @@ class FormattingResult(BaseModel):
     abstract: str = ""
     index_terms: list[str] = Field(default_factory=list)
     introduction: str = ""
-    literature_review: str = ""
-    methodology: str = ""
-    result_and_discussion: str = ""
-    conclusion: str = ""
-    future_scope: str = ""
+    motivation: str = ""
+    related_work: str = ""
+    research_gaps: str = ""
+    proposed_work: str = ""
+    results_and_discussion: str = ""
+    conclusion_and_future_work: str = ""
     formatting_notes: list[str] = Field(default_factory=list)
 
 
@@ -1764,9 +2081,10 @@ formatting_llm = structured(FormattingResult)
 FORMATTING_PROMPT = NO_INVENTION + """
 You are the Formatting Agent of PaperForge AI. FORMATTING ONLY.
 Organise the verified manuscript into a clean IEEE-style structure (title,
-abstract, Keywords, Introduction, Literature Review, Methodology, Result and
-Discussion, Conclusion, Future Scope).
+abstract, Keywords, Introduction, Motivation, Related Work, Research Gaps,
+Proposed Work, Results and Discussion, Conclusion and Future Work).
 - Do NOT change scientific content, facts, numbers, dataset/model names, metrics.
+- Preserve every equation, symbol, definition and equation number exactly.
 - Keep citation markers such as [SRC3] EXACTLY as they are.
 - Do not add claims, results, references, figures or tables.
 - Use the selected title if provided; keep existing keywords.
@@ -1816,8 +2134,62 @@ def formatting_node(state: ResearchState) -> dict:
     return update
 
 
+# 15. HUMANIZATION
 
-# 15. FINAL VALIDATION
+
+def humanizer_node(state: ResearchState) -> dict:
+    """Polish prose through the configured GoHumanize Space before validation."""
+    print("\n--- [Stage 16] Humanization ---")
+    if not os.getenv("GOHUMANIZE_SPACE_ID", "").strip():
+        note = "Skipped: GOHUMANIZE_SPACE_ID is not configured."
+        print(note)
+        return {
+            "final_manuscript": render_markdown(state),
+            "verification_results": [
+                {"verification_type": "humanization", "status": "skipped", "notes": [note]}
+            ],
+        }
+
+    update: dict[str, Any] = {}
+    changed: list[str] = []
+    errors: list[str] = []
+    for key in ["abstract"] + SECTION_KEYS:
+        original = state.get(key, "")
+        if not original.strip():
+            continue
+        try:
+            revised = humanize_text(original)
+            # Guard against accidental truncation from remote inference.
+            if revised.strip() and len(revised) >= 0.7 * len(original):
+                update[key] = revised
+                if revised != original:
+                    changed.append(key)
+            else:
+                update[key] = original
+                errors.append(f"{key}: output was unexpectedly short; retained formatted text.")
+        except Exception as exc:  # noqa: BLE001
+            update[key] = original
+            errors.append(f"{key}: {type(exc).__name__}: {str(exc)[:180]}")
+
+    merged = {**state, **update}
+    update["final_manuscript"] = render_markdown(merged)
+    outcome = "completed" if changed else ("completed_no_changes" if not errors else "partial")
+    update["verification_results"] = [
+        {
+            "verification_type": "humanization",
+            "status": outcome,
+            "sections": changed,
+            "notes": errors,
+        }
+    ]
+    print(f"Humanized sections: {', '.join(changed) or 'none'}")
+    if errors:
+        print("Humanization issues: " + "; ".join(errors))
+    return update
+
+
+
+# 16. FINAL VALIDATION
 
 
 
@@ -1839,10 +2211,12 @@ FINAL_VALIDATION_PROMPT = NO_INVENTION + """
 You are the Final Validation Agent of PaperForge AI. VALIDATION ONLY: do not
 rewrite anything. Decide whether the manuscript is ready to export to DOCX/PDF/LaTeX.
 
-Check: required content present (title, abstract, index terms, all major
-sections, references when citations are used); no placeholder text (TBD, TODO,
-INSERT HERE, PLACEHOLDER, XXX); references not obviously empty or disconnected
-from citations; no unresolved CRITICAL verification issue.
+Check: required content present (title, abstract, index terms, Introduction,
+Motivation, Related Work, Research Gaps, Proposed Work, Results and Discussion,
+Conclusion and Future Work, and references when citations are used); no
+placeholder text (TBD, TODO, INSERT HERE, PLACEHOLDER, XXX); references not
+obviously empty or disconnected from citations; no unresolved CRITICAL
+verification issue.
 
 Status: pass (ready), needs_revision (unresolved issue must be fixed),
 insufficient_evidence (missing evidence prevents reliable validation).
@@ -1854,7 +2228,7 @@ _PLACEHOLDER_RE = re.compile(r"\b(TBD|TODO|INSERT HERE|PLACEHOLDER|YOUR TEXT HER
 
 
 def final_validation_node(state: ResearchState) -> dict:
-    print("\n--- [Stage 16] Final Validation ---")
+    print("\n--- [Stage 17] Final Validation ---")
     llm_out = run_agent(
         final_validation_llm,
         FINAL_VALIDATION_PROMPT,
@@ -1876,13 +2250,12 @@ def final_validation_node(state: ResearchState) -> dict:
     for label, key in [
         ("Title", "selected_title"),
         ("Abstract", "abstract"),
-        ("Introduction", "introduction"),
-        ("Methodology", "methodology"),
-        ("Result and Discussion", "result_and_discussion"),
-        ("Conclusion", "conclusion"),
-        ("Future Scope", "future_scope"),
+        ("Index terms", "index_terms"),
+        *SECTION_ORDER,
     ]:
-        if not str(state.get(key, "")).strip():
+        value = state.get(key, "")
+        present = bool(value) if isinstance(value, (list, dict)) else bool(str(value).strip())
+        if not present:
             det.append(f"{label} is missing.")
     if _PLACEHOLDER_RE.search(state.get("final_manuscript", "")):
         det.append("Placeholder text remains in the manuscript.")
@@ -1951,6 +2324,22 @@ def route_after_final_validation(state: ResearchState) -> str:
 
 
 
+def _author_entries(state: ResearchState) -> list[dict[str, Any]]:
+    entries = []
+    for author in state.get("paper_metadata", {}).get("authors", []):
+        fields = [part.strip() for part in str(author).split("|")]
+        if fields and fields[0]:
+            entries.append({"name": fields[0], "details": [part for part in fields[1:] if part]})
+    return entries
+
+
+def _latex_author_block(author: dict[str, Any], number: int) -> str:
+    name = _tex(author["name"])
+    details = r"\\".join(_tex(detail) for detail in author["details"])
+    affiliation = f"\\IEEEauthorblockA{{{details}}}" if details else ""
+    return f"\\IEEEauthorblockN{{\\textsuperscript{{[{number}]}} {name}}}{affiliation}"
+
+
 def export_docx(state: ResearchState, output_dir: str) -> str:
     d = prepare_export(state)
     path = os.path.join(output_dir, "PaperForge_Final.docx")
@@ -1982,11 +2371,34 @@ def export_docx(state: ResearchState, output_dir: str) -> str:
 
     if d["title"]:
         para(d["title"], center=True, bold=True, size=16)
-    for author in state.get("paper_metadata", {}).get("authors", []):
-        fields = [x.strip() for x in str(author).split("|")]
-        para(fields[0], center=True)
-        if len(fields) > 1:
-            para("\n".join(fields[1:]), center=True, size=8)
+    authors = _author_entries(state)
+    if authors:
+        author_table = doc.add_table(rows=(len(authors) + 2) // 3, cols=3)
+        author_table.autofit = False
+        for row in author_table.rows:
+            for cell in row.cells:
+                cell.width = Inches(2.15)
+        borders = OxmlElement("w:tblBorders")
+        for edge in ("top", "left", "bottom", "right", "insideH", "insideV"):
+            border = OxmlElement(f"w:{edge}")
+            border.set(qn("w:val"), "nil")
+            borders.append(border)
+        author_table._tbl.tblPr.append(borders)
+        for index, author in enumerate(authors):
+            cell = author_table.cell(index // 3, index % 3)
+            paragraph = cell.paragraphs[0]
+            paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            paragraph.paragraph_format.space_after = Pt(0)
+            name_run = paragraph.add_run(f"[{index + 1}] {author['name']}")
+            name_run.bold = True
+            name_run.font.name, name_run.font.size = "Times New Roman", Pt(10)
+            for detail in author["details"]:
+                detail_paragraph = cell.add_paragraph()
+                detail_paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                detail_paragraph.paragraph_format.space_after = Pt(0)
+                detail_run = detail_paragraph.add_run(detail)
+                detail_run.font.name, detail_run.font.size = "Times New Roman", Pt(9)
+        doc.add_paragraph()
 
     body = doc.add_section(WD_SECTION.CONTINUOUS)
     body.top_margin = body.bottom_margin = Inches(.75)
@@ -1997,12 +2409,17 @@ def export_docx(state: ResearchState, output_dir: str) -> str:
     if d["index_terms"]:
         para("Keywords— " + ", ".join(d["index_terms"]), bold=True)
 
-    roman = ["I", "II", "III", "IV", "V", "VI", "VII", "VIII"]
-    for i, (title, text) in enumerate(d["sections"]):
-        para(f"{roman[i]}. {title.upper()}", center=True, bold=True)
+    for number, title, text in d["sections"]:
+        para(f"{number}. {title.upper()}", center=True, bold=True)
         for text_para in re.split(r"\n\s*\n", text):
             if text_para.strip():
                 para(text_para.strip())
+        if title.lower() == "proposed work" and d["architecture_diagram"]:
+            doc.add_picture(d["architecture_diagram"], width=Inches(3.4))
+            para("Fig. 1. System architecture and component flow.", size=8)
+        if title.lower() == "results and discussion" and d["results_chart"]:
+            doc.add_picture(d["results_chart"], width=Inches(3.4))
+            para("Fig. 2. Performance comparison using supplied model_metrics data.", size=8)
 
     para("REFERENCES", center=True, bold=True)
     for i, r in enumerate(d["references"], 1):
@@ -2030,6 +2447,31 @@ def export_pdf(state: ResearchState, output_dir: str) -> str:
     if d["title"]:
         story.append(Paragraph(_pdf_escape(d["title"]), styles["Title"]))
         story.append(Spacer(1, 12))
+    authors = _author_entries(state)
+    if authors:
+        author_style = styles["BodyText"].clone("AuthorBlock")
+        author_style.alignment = TA_CENTER
+        author_cells = [
+            Paragraph(
+                f"<super>[{index + 1}]</super> <b>{_pdf_escape(author['name'])}</b><br/>"
+                + "<br/>".join(_pdf_escape(detail) for detail in author["details"]),
+                author_style,
+            )
+            for index, author in enumerate(authors)
+        ]
+        author_rows = [author_cells[index:index + 3] for index in range(0, len(author_cells), 3)]
+        if len(author_rows[-1]) < 3:
+            author_rows[-1].extend([""] * (3 - len(author_rows[-1])))
+        author_table = Table(author_rows, colWidths=[(A4[0] - 100) / 3] * 3, hAlign="CENTER")
+        author_table.setStyle(TableStyle([
+            ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 4),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+            ("TOPPADDING", (0, 0), (-1, -1), 2),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 10),
+        ]))
+        story.extend([author_table, Spacer(1, 8)])
     if d["abstract"]:
         story.append(Paragraph("Abstract", styles["Heading1"]))
         block(d["abstract"])
@@ -2037,10 +2479,15 @@ def export_pdf(state: ResearchState, output_dir: str) -> str:
         story.append(Paragraph("Keywords", styles["Heading1"]))
         block(", ".join(d["index_terms"]))
 
-    roman = ["I", "II", "III", "IV", "V", "VI", "VII", "VIII"]
-    for i, (title, text) in enumerate(d["sections"]):
-        story.append(Paragraph(f"{roman[i]}. {_pdf_escape(title)}", styles["Heading1"]))
+    for number, title, text in d["sections"]:
+        story.append(Paragraph(f"{number}. {_pdf_escape(title)}", styles["Heading1"]))
         block(text)
+        if title.lower() == "proposed work" and d["architecture_diagram"]:
+            story.append(ReportLabImage(d["architecture_diagram"], width=430, height=260, kind="proportional"))
+            block("Fig. 1. System architecture and component flow.")
+        if title.lower() == "results and discussion" and d["results_chart"]:
+            story.append(ReportLabImage(d["results_chart"], width=430, height=260, kind="proportional"))
+            block("Fig. 2. Performance comparison using supplied model_metrics data.")
 
     story.append(Paragraph("References", styles["Heading1"]))
     for i, r in enumerate(d["references"], 1):
@@ -2073,9 +2520,9 @@ def export_latex(state: ResearchState, output_dir: str) -> str:
         "\\usepackage{graphicx,amsmath,booktabs,url}",
         "\\begin{document}",
         f"\\title{{{_tex(d['title'])}}}",
-        "\\author{" + " \\\\ ".join(
-            _tex(str(author).replace("|", ", "))
-            for author in state.get("paper_metadata", {}).get("authors", [])
+        "\\author{" + " \\and ".join(
+            _latex_author_block(author, index + 1)
+            for index, author in enumerate(_author_entries(state))
         ) + "}",
         "\\maketitle",
     ]
@@ -2083,8 +2530,12 @@ def export_latex(state: ResearchState, output_dir: str) -> str:
         tex.append(f"\\begin{{abstract}}\n{_tex(d['abstract'])}\n\\end{{abstract}}")
     if d["index_terms"]:
         tex.append(f"\\begin{{IEEEkeywords}}\n{_tex(', '.join(d['index_terms']))}\n\\end{{IEEEkeywords}}")
-    for title, text in d["sections"]:
+    for _, title, text in d["sections"]:
         tex.append(f"\\section{{{_tex(title)}}}\n\n{_tex(text)}")
+        if title.lower() == "proposed work" and d["architecture_diagram"]:
+            tex.append("\\begin{figure}[htbp]\\centering\\includegraphics[width=0.9\\linewidth]{architecture_diagram.png}\\caption{System architecture and component flow.}\\end{figure}")
+        if title.lower() == "results and discussion" and d["results_chart"]:
+            tex.append("\\begin{figure}[htbp]\\centering\\includegraphics[width=0.9\\linewidth]{results_comparison.png}\\caption{Performance comparison using supplied model metrics.}\\end{figure}")
     tex.append("\\begin{thebibliography}{99}")
     for i, r in enumerate(d["references"], 1):
         tex.append(f"\\bibitem{{ref{i}}} {_tex(r)}")
@@ -2109,7 +2560,11 @@ def document_export_node(state: ResearchState) -> dict:
 
     output_dir = os.path.join("outputs", "final")
     os.makedirs(output_dir, exist_ok=True)
+    diagram_path = generate_napkin_diagram(state, output_dir)
+    chart_path = generate_results_chart(state, output_dir)
+    state = {**state, "architecture_diagram": diagram_path, "results_chart": chart_path}
     files = list(state.get("output_files", []))
+    files.extend(path for path in (diagram_path, chart_path) if path and path not in files)
     for label, fn in (("DOCX", export_docx), ("PDF", export_pdf), ("LaTeX", export_latex)):
         try:
             p = fn(state, output_dir)
@@ -2138,6 +2593,7 @@ graph.add_node("literature_analysis", literature_analysis_node, retry_policy=RET
 graph.add_node("literature_synthesis", literature_synthesis_node, retry_policy=RETRY)
 graph.add_node("research_gap", research_gap_node, retry_policy=RETRY)
 graph.add_node("paper_outline", paper_outline_node, retry_policy=RETRY)
+graph.add_node("outline_review", outline_review_node, retry_policy=RETRY)
 graph.add_node("human_approval", human_approval_node)
 graph.add_node("writer", writer_node, retry_policy=RETRY)
 graph.add_node("citation_verification", citation_verification_node, retry_policy=RETRY)
@@ -2146,6 +2602,7 @@ graph.add_node("consistency_verification", consistency_verification_node, retry_
 graph.add_node("review", review_node, retry_policy=RETRY)
 graph.add_node("revision", revision_node, retry_policy=RETRY)
 graph.add_node("formatting", formatting_node, retry_policy=RETRY)
+graph.add_node("humanizer", humanizer_node)
 graph.add_node("final_validation", final_validation_node, retry_policy=RETRY)
 graph.add_node("document_export", document_export_node)
 
@@ -2170,7 +2627,12 @@ graph.add_edge("literature_analysis", "literature_synthesis")
 graph.add_edge("literature_synthesis", "research_gap")
 
 graph.add_edge("research_gap", "paper_outline")
-graph.add_edge("paper_outline", "human_approval")
+graph.add_edge("paper_outline", "outline_review")
+graph.add_conditional_edges(
+    "outline_review",
+    route_after_outline_review,
+    {"human_approval": "human_approval", "research_planner": "research_planner"},
+)
 graph.add_conditional_edges(
     "human_approval",
     route_after_human_approval,
@@ -2194,7 +2656,8 @@ graph.add_conditional_edges(
 # The approved workflow continues from Revision to Formatting.
 graph.add_edge("revision", "formatting")
 
-graph.add_edge("formatting", "final_validation")
+graph.add_edge("formatting", "humanizer")
+graph.add_edge("humanizer", "final_validation")
 graph.add_conditional_edges(
     "final_validation",
     route_after_final_validation,

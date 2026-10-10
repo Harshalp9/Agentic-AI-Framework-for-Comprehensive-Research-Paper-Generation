@@ -3,6 +3,7 @@ import os
 import random
 import threading
 import time
+from pathlib import Path
 
 import requests
 from dotenv import load_dotenv
@@ -136,3 +137,70 @@ def search_semantic_scholar(query: str) -> str:
         return json.dumps(
             {"data": [], "error": f"Semantic Scholar search failed: {error}.{note}"}
         )
+
+
+@tool
+def generate_napkin_visual(content: str, context: str, output_path: str) -> str:
+    """Create and download a Napkin AI visual from supplied system details.
+
+    Requires NAPKIN_API_KEY. Returns a JSON object containing `ok` and either
+    the downloaded file path or a non-sensitive error description.
+    """
+    token = os.getenv("NAPKIN_API_KEY", "").strip()
+    if not token:
+        return json.dumps({"ok": False, "error": "NAPKIN_API_KEY is not configured."})
+    if not content.strip():
+        return json.dumps({"ok": False, "error": "Visual content is empty."})
+
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+    try:
+        response = requests.post(
+            "https://api.napkin.ai/v1/visual",
+            headers=headers,
+            json={
+                "format": "png",
+                "content": content[:12000],
+                "context": context[:3000],
+                "number_of_visuals": 1,
+                "orientation": "horizontal",
+            },
+            timeout=30,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        request_id = payload.get("request_id") or payload.get("id")
+        if not request_id:
+            return json.dumps({"ok": False, "error": "Napkin response omitted the request identifier."})
+
+        deadline = time.monotonic() + 150
+        while time.monotonic() < deadline:
+            status_response = requests.get(
+                f"https://api.napkin.ai/v1/visual/{request_id}/status",
+                headers=headers,
+                timeout=20,
+            )
+            status_response.raise_for_status()
+            status = status_response.json()
+            if status.get("status") == "failed":
+                return json.dumps({"ok": False, "error": "Napkin visual generation failed."})
+            if status.get("status") == "completed":
+                generated_files = status.get("generated_files") or []
+                file_url = generated_files[0].get("url") if generated_files else None
+                if not file_url:
+                    return json.dumps({"ok": False, "error": "Napkin completed without a file URL."})
+                image_response = requests.get(file_url, headers=headers, timeout=30)
+                image_response.raise_for_status()
+                target = Path(output_path)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(image_response.content)
+                return json.dumps({"ok": True, "path": str(target)})
+            time.sleep(3)
+
+        return json.dumps({"ok": False, "error": "Napkin visual generation timed out."})
+    except requests.RequestException as error:
+        # Do not include request headers or credentials in the returned error.
+        status_code = error.response.status_code if error.response is not None else None
+        detail = f"Napkin API request failed (HTTP {status_code})." if status_code else "Napkin API request failed."
+        return json.dumps({"ok": False, "error": detail})
+    except (OSError, ValueError) as error:
+        return json.dumps({"ok": False, "error": f"Could not save/read Napkin response: {error}"})
