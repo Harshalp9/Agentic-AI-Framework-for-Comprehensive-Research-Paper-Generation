@@ -102,6 +102,6 @@ The maximum revision cycles can also be adjusted in the app sidebar.
 
 - `app.py` - Streamlit interface and workflow controls.
 - `paper.py` - LangGraph research, writing, verification, and export workflow.
-- `tools.py` - Semantic Scholar search tool.
+- `tools.py` - Semantic Scholar search tool, Napkin ai tool.
 - `requirements.txt` - Python dependencies.
 - `Config.TOML` - Streamlit-related configuration file included in the project.
