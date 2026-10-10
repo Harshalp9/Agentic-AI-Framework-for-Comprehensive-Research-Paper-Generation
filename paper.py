@@ -100,9 +100,12 @@ if os.getenv("GOOGLE_API_KEY"):
     except Exception as exc:  # noqa: BLE001
         print(f"Gemini unavailable: {exc}")
 
-# Tool-calling model for literature search
-tools = [search_semantic_scholar]
-llm_with_tools = (gemini if gemini is not None else mistral).bind_tools(tools)
+# Keep both tools available centrally, but expose only the relevant tool to
+# each model so literature research cannot trigger diagram generation.
+tools = [search_semantic_scholar, generate_napkin_visual]
+tool_llm = gemini if gemini is not None else mistral
+llm_with_tools = tool_llm.bind_tools([search_semantic_scholar])
+napkin_llm_with_tools = tool_llm.bind_tools([generate_napkin_visual])
 
 
 def structured(schema):
@@ -337,6 +340,8 @@ class ResearchState(TypedDict, total=False):
     # Output
     final_manuscript: str
     output_files: list[str]
+    generate_architecture_diagram: bool
+    architecture_diagram: str
 
 
 
@@ -1974,35 +1979,82 @@ def prepare_export(state: ResearchState) -> dict:
     }
 
 
-def generate_napkin_diagram(state: ResearchState, output_dir: str) -> str:
-    """Use the Napkin LangChain tool for an evidence-grounded architecture visual."""
-    if not os.getenv("NAPKIN_API_KEY", "").strip() or not state.get("proposed_work"):
-        return ""
+def napkin_request_node(state: ResearchState) -> dict:
+    """Ask the bound Napkin tool model to request a diagram for Proposed Work."""
+    print("\n--- [Stage 17] Napkin Architecture Diagram ---")
+    output_dir = os.path.join("outputs", "final")
+    os.makedirs(output_dir, exist_ok=True)
     profile = state.get("project_profile", {})
-    tool_result = generate_napkin_visual.invoke(
-        {
-            "content": (
-                f"System architecture and component flow for "
-                f"{profile.get('research_title') or 'the proposed system'}. "
-                f"Use only these described details; do not add components: "
-                f"{state.get('proposed_work', '')}"
-            ),
-            "context": (
-                "Create a clear academic architecture diagram showing only the "
-                "described components, their relationships, and system flow."
-            ),
-            "output_path": os.path.join(output_dir, "architecture_diagram.png"),
-        }
+    content = (
+        f"System architecture and component flow for "
+        f"{profile.get('research_title') or 'the proposed system'}. "
+        f"Use only these described details; do not add components: "
+        f"{state.get('proposed_work', '')}"
     )
-    try:
-        result = json.loads(tool_result)
-    except (TypeError, ValueError):
-        logging.warning("Napkin visual tool returned an unreadable response.")
-        return ""
-    if result.get("ok"):
-        return result.get("path", "")
-    logging.warning("Napkin architecture diagram unavailable: %s", result.get("error", "unknown error"))
-    return ""
+    context = (
+        "Create a clear academic architecture diagram showing only the "
+        "described components, their relationships, and system flow."
+    )
+    output_path = os.path.join(output_dir, "architecture_diagram.png")
+    response = napkin_llm_with_tools.invoke(
+        [
+            SystemMessage(
+                content=(
+                    "Call generate_napkin_visual exactly once using the supplied "
+                    "content, context, and output_path. Do not answer in prose."
+                )
+            ),
+            HumanMessage(
+                content=json.dumps(
+                    {"content": content, "context": context, "output_path": output_path}
+                )
+            ),
+        ]
+    )
+    calls = getattr(response, "tool_calls", [])
+    if len(calls) != 1 or calls[0].get("name") != "generate_napkin_visual":
+        logging.warning("Napkin model did not request the expected diagram tool.")
+        return {"messages": [response]}
+
+    call = calls[0]
+    safe_call = {
+        "name": "generate_napkin_visual",
+        "args": {"content": content, "context": context, "output_path": output_path},
+        "id": call["id"],
+        "type": "tool_call",
+    }
+    return {"messages": [response.model_copy(update={"tool_calls": [safe_call]})]}
+
+
+def route_after_napkin_request(state: ResearchState) -> str:
+    messages = state.get("messages", [])
+    if messages and getattr(messages[-1], "tool_calls", None):
+        return "napkin_tool"
+    return "document_export"
+
+
+def napkin_result_node(state: ResearchState) -> dict:
+    """Record the image path returned by the Napkin ToolNode."""
+    for message in reversed(state.get("messages", [])):
+        if isinstance(message, ToolMessage) and message.name == "generate_napkin_visual":
+            try:
+                result = json.loads(message.content)
+            except (TypeError, ValueError):
+                logging.warning("Napkin visual tool returned an unreadable response.")
+                return {"architecture_diagram": ""}
+            if result.get("ok"):
+                path = result.get("path", "")
+                files = list(state.get("output_files", []))
+                if path and path not in files:
+                    files.append(path)
+                return {"architecture_diagram": path, "output_files": files}
+            logging.warning(
+                "Napkin architecture diagram unavailable: %s",
+                result.get("error", "unknown error"),
+            )
+            return {"architecture_diagram": ""}
+    logging.warning("Napkin tool node completed without a visual result.")
+    return {"architecture_diagram": ""}
 
 
 def generate_results_chart(state: ResearchState, output_dir: str) -> str:
@@ -2311,10 +2363,17 @@ def final_validation_node(state: ResearchState) -> dict:
 
 
 def route_after_final_validation(state: ResearchState) -> str:
-    if state.get("final_validation_status", "").strip().lower() == "pass":
-        return "document_export"
-    if state.get("revision_count", 0) >= MAX_REVISIONS:
+    should_export = state.get("final_validation_status", "").strip().lower() == "pass"
+    if not should_export and state.get("revision_count", 0) >= MAX_REVISIONS:
         print("Revision cap reached - exporting with unresolved validation issues.")
+        should_export = True
+    if should_export:
+        if (
+            state.get("generate_architecture_diagram", False)
+            and os.getenv("NAPKIN_API_KEY", "").strip()
+            and state.get("proposed_work", "").strip()
+        ):
+            return "napkin_request"
         return "document_export"
     return "revision"
 
@@ -2390,7 +2449,7 @@ def export_docx(state: ResearchState, output_dir: str) -> str:
             paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
             paragraph.paragraph_format.space_after = Pt(0)
             name_run = paragraph.add_run(f"[{index + 1}] {author['name']}")
-            name_run.bold = True
+            name_run.bold = False
             name_run.font.name, name_run.font.size = "Times New Roman", Pt(10)
             for detail in author["details"]:
                 detail_paragraph = cell.add_paragraph()
@@ -2453,7 +2512,7 @@ def export_pdf(state: ResearchState, output_dir: str) -> str:
         author_style.alignment = TA_CENTER
         author_cells = [
             Paragraph(
-                f"<super>[{index + 1}]</super> <b>{_pdf_escape(author['name'])}</b><br/>"
+                f"<super>[{index + 1}]</super> {_pdf_escape(author['name'])}<br/>"
                 + "<br/>".join(_pdf_escape(detail) for detail in author["details"]),
                 author_style,
             )
@@ -2547,7 +2606,7 @@ def export_latex(state: ResearchState, output_dir: str) -> str:
 
 
 def document_export_node(state: ResearchState) -> dict:
-    print("\n--- [Stage 17] Document Export ---")
+    print("\n--- [Stage 18] Document Export ---")
     status = state.get("final_validation_status", "")
     forced = state.get("revision_count", 0) >= MAX_REVISIONS
     if status != "pass" and not forced:
@@ -2560,11 +2619,11 @@ def document_export_node(state: ResearchState) -> dict:
 
     output_dir = os.path.join("outputs", "final")
     os.makedirs(output_dir, exist_ok=True)
-    diagram_path = generate_napkin_diagram(state, output_dir)
     chart_path = generate_results_chart(state, output_dir)
-    state = {**state, "architecture_diagram": diagram_path, "results_chart": chart_path}
+    state = {**state, "results_chart": chart_path}
     files = list(state.get("output_files", []))
-    files.extend(path for path in (diagram_path, chart_path) if path and path not in files)
+    if chart_path and chart_path not in files:
+        files.append(chart_path)
     for label, fn in (("DOCX", export_docx), ("PDF", export_pdf), ("LaTeX", export_latex)):
         try:
             p = fn(state, output_dir)
@@ -2586,7 +2645,10 @@ graph.add_node("supervisor", supervisor_node)
 graph.add_node("project_understanding", project_understanding_node, retry_policy=RETRY)
 graph.add_node("research_planner", research_planner_node, retry_policy=RETRY)
 graph.add_node("literature_research", literature_research_node, retry_policy=RETRY)
-graph.add_node("semantic_scholar", ToolNode(tools))
+graph.add_node("semantic_scholar", ToolNode([search_semantic_scholar]))
+graph.add_node("napkin_request", napkin_request_node)
+graph.add_node("napkin_tool", ToolNode([generate_napkin_visual]))
+graph.add_node("napkin_result", napkin_result_node)
 graph.add_node("collect_literature", collect_literature_node)
 graph.add_node("paper_filtering", paper_filtering_node)
 graph.add_node("literature_analysis", literature_analysis_node, retry_policy=RETRY)
@@ -2661,8 +2723,19 @@ graph.add_edge("humanizer", "final_validation")
 graph.add_conditional_edges(
     "final_validation",
     route_after_final_validation,
-    {"document_export": "document_export", "revision": "revision"},
+    {
+        "napkin_request": "napkin_request",
+        "document_export": "document_export",
+        "revision": "revision",
+    },
 )
+graph.add_conditional_edges(
+    "napkin_request",
+    route_after_napkin_request,
+    {"napkin_tool": "napkin_tool", "document_export": "document_export"},
+)
+graph.add_edge("napkin_tool", "napkin_result")
+graph.add_edge("napkin_result", "document_export")
 graph.add_edge("document_export", END)
 
 app = graph.compile(checkpointer=InMemorySaver())

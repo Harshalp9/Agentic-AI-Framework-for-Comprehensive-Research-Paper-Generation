@@ -53,7 +53,7 @@ NAPKIN_API_KEY=your_napkin_api_token
 ```
 
 Keep `.env` private and do not commit API keys. `PRIMARY_LLM` can be set to `gemini` when `GOOGLE_API_KEY` is configured. Gemini is optional; Mistral is the default provider.
-When configured, Napkin generates an architecture/component-flow visual from the Proposed Work section during export. If Napkin is unavailable, document export continues without the diagram. Add verified numeric results and baselines to the supplied results JSON/CSV for comparison tables and charts; unsupported metrics are never fabricated.
+When configured, the project form lets you opt in to Napkin architecture diagrams. If enabled, the workflow calls Napkin after final validation and before document export, using only the Proposed Work section. If Napkin is unavailable or does not return a visual, document export continues without the diagram. Add verified numeric results and baselines to the supplied results JSON/CSV for comparison tables and charts; unsupported metrics are never fabricated.
 
 To enable final-paper humanization, set `GOHUMANIZE_SPACE_ID` to the Hugging Face owner/Space name for your Gradio Space. `HF_TOKEN` is only required for a private Space. The humanizer runs on the abstract and paper sections after formatting, sends text in requests of at most 5,000 characters, and keeps citations, equations, URLs, and code blocks intact. References are not sent to the service. If the Space is not configured or a request fails, the workflow retains the formatted text and continues to final validation. The Space's free ZeroGPU quota can limit availability; without a Space ID, humanization is skipped.
 

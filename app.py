@@ -124,6 +124,7 @@ STAGES = [
     ("formatting", "Format", "🎨"),
     ("humanizer", "Humanize", "✨"),
     ("final_validation", "Validate", "🛡️"),
+    ("napkin_request", "Architecture diagram", "🖼️"),
     ("document_export", "Export", "📦"),
 ]
 STAGE_IDS = [s[0] for s in STAGES]
@@ -131,6 +132,8 @@ STAGE_IDS = [s[0] for s in STAGES]
 NODE_TO_STAGE = {
     "semantic_scholar": "literature_research",
     "collect_literature": "literature_research",
+    "napkin_tool": "napkin_request",
+    "napkin_result": "napkin_request",
 }
 STAY_ON_STAGE = {"literature_research", "semantic_scholar", "writer"}
 
@@ -156,6 +159,9 @@ NODE_LABELS = {
     "formatting": "Formatting",
     "humanizer": "Humanization",
     "final_validation": "Final validation",
+    "napkin_request": "Napkin diagram request",
+    "napkin_tool": "Napkin visual generation",
+    "napkin_result": "Napkin diagram result",
     "document_export": "Document export",
 }
 
@@ -435,6 +441,18 @@ def view_setup():
             accept_multiple_files=True,
             help="Each file becomes a named evidence source, e.g. metrics.csv -> 'metrics'.",
         )
+        napkin_configured = bool(os.getenv("NAPKIN_API_KEY", "").strip())
+        generate_diagram = st.checkbox(
+            "Generate architecture diagram with Napkin",
+            value=napkin_configured,
+            disabled=not napkin_configured,
+            help=(
+                "When enabled, Napkin creates a diagram from the Proposed Work section "
+                "after final validation."
+                if napkin_configured
+                else "Set NAPKIN_API_KEY to enable Napkin diagram generation."
+            ),
+        )
         with st.expander("Advanced: paste results as JSON"):
             results_json = st.text_area(
                 "actual_results JSON",
@@ -474,6 +492,7 @@ def view_setup():
             "messages": [],
             "actual_results": actual,
             "paper_metadata": {"authors": [line.strip() for line in author_lines.splitlines() if line.strip()]},
+            "generate_architecture_diagram": generate_diagram,
         }
         ss.seen, ss.last, ss.log, ss.revisions, ss.error = [], None, [], 0, None
         ss.phase = "running"
