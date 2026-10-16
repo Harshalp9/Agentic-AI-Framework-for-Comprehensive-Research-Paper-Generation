@@ -32,7 +32,7 @@ from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 from reportlab.platypus import Image as ReportLabImage
 
-from tools import generate_napkin_visual, search_semantic_scholar
+from tools import generate_qwen_architecture, search_semantic_scholar
 from humanizer_client import humanize_text
 
 load_dotenv()
@@ -100,12 +100,11 @@ if os.getenv("GOOGLE_API_KEY"):
     except Exception as exc:  # noqa: BLE001
         print(f"Gemini unavailable: {exc}")
 
-# Keep both tools available centrally, but expose only the relevant tool to
-# each model so literature research cannot trigger diagram generation.
-tools = [search_semantic_scholar, generate_napkin_visual]
+# Literature search is the only tool exposed to the research agent. The
+# architecture diagram is generated separately by the local Ollama model.
+tools = [search_semantic_scholar]
 tool_llm = gemini if gemini is not None else mistral
 llm_with_tools = tool_llm.bind_tools([search_semantic_scholar])
-napkin_llm_with_tools = tool_llm.bind_tools([generate_napkin_visual])
 
 
 def structured(schema):
@@ -1169,7 +1168,10 @@ SECTION GUIDES
   numbered display line followed immediately by a "where" paragraph defining
   all symbols, following a formal methodology-chapter style. Then describe the
   algorithm and step-by-step implementation, including inputs, outputs and
-  parameters exactly as provided. Never invent details; list missing items in
+  parameters exactly as provided. Put every lettered subsection heading
+  ("A. ...:", "B. ...:", etc.) on its own line, with the subsection prose
+  starting in the next paragraph. Never keep a heading inline after the
+  preceding paragraph. Never invent details; list missing items in
   unsupported_or_missing.
 
 - VI. Results and Discussion: two parts.
@@ -1258,7 +1260,122 @@ def writer_node(state: ResearchState) -> dict:
 def route_after_writer(state: ResearchState) -> str:
     if _pending_sections(state) or "abstract" not in state.get("completed_sections", []):
         return "writer"
-    return "citation_verification"
+    return "methodology_formulas"
+
+
+# 8. METHOD FORMULAS
+
+
+class MethodFormulaResult(BaseModel):
+    proposed_work: str = Field(
+        description="Complete Proposed Work section, preserving its prose and citations while adding supported display equations."
+    )
+    formulas_added: list[str] = Field(default_factory=list)
+    notes: list[str] = Field(default_factory=list)
+
+
+METHOD_FORMULA_PROMPT = NO_INVENTION + """
+You are the Method Analysis and Equation Agent. Read the already written Proposed
+Work section and identify the methods, transformations, training objectives and
+evaluation measures it actually describes. Add a small number of useful,
+standard mathematical formulas to the relevant method subsections, following
+the academic-methodology style in the examples provided by the user.
+
+Evidence rules:
+- Use only methods and operations explicitly described in Proposed Work and
+  confirmed project facts. Do not add a model, preprocessing step, loss,
+  optimizer, metric, data operation or parameter that is not stated.
+- A canonical formula for an explicitly named standard method or metric is
+  allowed, but say it is the method's definition and do not imply that it was
+  implemented unless the project text confirms that.
+- If no equation is both supported and useful, return the original section
+  unchanged and leave formulas_added empty. Never force a formula.
+- Do not fabricate values, measurements, citations, implementation details or
+  results. Do not add an equation based only on the application domain.
+
+Output and style:
+- Return the entire Proposed Work section. Preserve all existing prose,
+  headings, claims and [SRCn] citations verbatim; only insert equation blocks.
+- Place each formula directly after the paragraph describing that method.
+- Put each equation alone on a line, with a consecutive number in parentheses,
+  starting after the largest equation number already present in this section.
+- Immediately follow every equation with a separate paragraph beginning
+  "where" that defines every symbol and any assumptions in plain language.
+- Use readable ASCII plain-text mathematical notation (for example,
+  x_norm = (x - x_min) / (x_max - x_min)); avoid uncommon Unicode glyphs so
+  equations render consistently in DOCX, PDF and LaTeX exports. Do not use
+  Markdown/LaTeX math delimiters or LaTeX commands.
+- Keep the section's existing formal, concise academic style.
+Return proposed_work, formulas_added, and notes.
+"""
+
+
+method_formula_llm = gemini.with_structured_output(MethodFormulaResult) if gemini is not None else None
+
+
+def _preserves_method_text(original: str, revised: str) -> bool:
+    """Reject a Gemini result that drops or rewrites any original paragraph."""
+    normalize = lambda value: re.sub(r"\s+", " ", value).strip().casefold()
+    revised_normalized = normalize(revised)
+    paragraphs = [normalize(part) for part in re.split(r"\n\s*\n", original) if normalize(part)]
+    cursor = 0
+    for paragraph in paragraphs:
+        found = revised_normalized.find(paragraph, cursor)
+        if found < 0:
+            return False
+        cursor = found + len(paragraph)
+    return bool(revised.strip())
+
+
+def methodology_formulas_node(state: ResearchState) -> dict:
+    """Use Gemini to add evidence-grounded equations to Proposed Work."""
+    print("\n--- [Stage 8] Gemini Method Analysis and Formulas ---")
+    original = state.get("proposed_work", "")
+    if not original.strip():
+        return {"verification_results": [{
+            "verification_type": "method_formulas", "status": "skipped",
+            "notes": ["Proposed Work is empty."],
+        }]}
+    if method_formula_llm is None:
+        note = "Skipped: configure GOOGLE_API_KEY to enable Gemini method analysis and formulas."
+        print(note)
+        return {"verification_results": [{
+            "verification_type": "method_formulas", "status": "skipped", "notes": [note],
+        }]}
+    try:
+        result = method_formula_llm.invoke([
+            SystemMessage(content=METHOD_FORMULA_PROMPT),
+            HumanMessage(content=json.dumps({
+                "PROPOSED WORK": original,
+                "CONFIRMED PROJECT FACTS": state.get("confirmed_facts", []),
+                "PROJECT METHODOLOGY PROFILE": state.get("project_profile", {}).get("methodology", ""),
+                "MODEL AND ALGORITHM DETAILS": state.get("project_profile", {}).get("algorithms_models", []),
+                "DATA PREPROCESSING DETAILS": state.get("project_profile", {}).get("preprocessing", []),
+                "EVALUATION METRICS": state.get("project_profile", {}).get("evaluation_metrics", []),
+            }, ensure_ascii=False)),
+        ])
+        revised = result.proposed_work
+        if not _preserves_method_text(original, revised):
+            raise ValueError("Gemini output did not preserve the existing Proposed Work text.")
+        added = [item for item in result.formulas_added if item.strip()]
+        changed = revised.strip() != original.strip()
+        status = "completed" if changed else "completed_no_changes"
+        note_list = list(result.notes)
+        if not added and not changed:
+            note_list.append("No additional evidence-supported formula was needed.")
+        return {
+            "proposed_work": revised if changed else original,
+            "verification_results": [{
+                "verification_type": "method_formulas", "status": status,
+                "formulas_added": added, "notes": note_list,
+            }],
+        }
+    except Exception as exc:  # noqa: BLE001
+        note = f"Gemini method analysis failed; retained the original Proposed Work: {type(exc).__name__}: {str(exc)[:180]}"
+        logging.warning(note)
+        return {"verification_results": [{
+            "verification_type": "method_formulas", "status": "failed", "notes": [note],
+        }]}
 
 
 
@@ -1979,81 +2096,27 @@ def prepare_export(state: ResearchState) -> dict:
     }
 
 
-def napkin_request_node(state: ResearchState) -> dict:
-    """Ask the bound Napkin tool model to request a diagram for Proposed Work."""
-    print("\n--- [Stage 17] Napkin Architecture Diagram ---")
+def architecture_diagram_node(state: ResearchState) -> dict:
+    """Use local Qwen to extract a diagram spec from the approved Proposed Work."""
+    print("\n--- [Stage 17] Local Qwen Architecture Diagram ---")
     output_dir = os.path.join("outputs", "final")
     os.makedirs(output_dir, exist_ok=True)
-    profile = state.get("project_profile", {})
-    content = (
-        f"System architecture and component flow for "
-        f"{profile.get('research_title') or 'the proposed system'}. "
-        f"Use only these described details; do not add components: "
-        f"{state.get('proposed_work', '')}"
-    )
-    context = (
-        "Create a clear academic architecture diagram showing only the "
-        "described components, their relationships, and system flow."
-    )
+    content = state.get("proposed_work", "").strip()
     output_path = os.path.join(output_dir, "architecture_diagram.png")
-    response = napkin_llm_with_tools.invoke(
-        [
-            SystemMessage(
-                content=(
-                    "Call generate_napkin_visual exactly once using the supplied "
-                    "content, context, and output_path. Do not answer in prose."
-                )
-            ),
-            HumanMessage(
-                content=json.dumps(
-                    {"content": content, "context": context, "output_path": output_path}
-                )
-            ),
-        ]
-    )
-    calls = getattr(response, "tool_calls", [])
-    if len(calls) != 1 or calls[0].get("name") != "generate_napkin_visual":
-        logging.warning("Napkin model did not request the expected diagram tool.")
-        return {"messages": [response]}
-
-    call = calls[0]
-    safe_call = {
-        "name": "generate_napkin_visual",
-        "args": {"content": content, "context": context, "output_path": output_path},
-        "id": call["id"],
-        "type": "tool_call",
-    }
-    return {"messages": [response.model_copy(update={"tool_calls": [safe_call]})]}
-
-
-def route_after_napkin_request(state: ResearchState) -> str:
-    messages = state.get("messages", [])
-    if messages and getattr(messages[-1], "tool_calls", None):
-        return "napkin_tool"
-    return "document_export"
-
-
-def napkin_result_node(state: ResearchState) -> dict:
-    """Record the image path returned by the Napkin ToolNode."""
-    for message in reversed(state.get("messages", [])):
-        if isinstance(message, ToolMessage) and message.name == "generate_napkin_visual":
-            try:
-                result = json.loads(message.content)
-            except (TypeError, ValueError):
-                logging.warning("Napkin visual tool returned an unreadable response.")
-                return {"architecture_diagram": ""}
-            if result.get("ok"):
-                path = result.get("path", "")
-                files = list(state.get("output_files", []))
-                if path and path not in files:
-                    files.append(path)
-                return {"architecture_diagram": path, "output_files": files}
-            logging.warning(
-                "Napkin architecture diagram unavailable: %s",
-                result.get("error", "unknown error"),
-            )
-            return {"architecture_diagram": ""}
-    logging.warning("Napkin tool node completed without a visual result.")
+    if not content:
+        return {"architecture_diagram": ""}
+    try:
+        result = json.loads(generate_qwen_architecture(content, output_path))
+    except (TypeError, ValueError) as exc:
+        logging.warning("Qwen diagram generation returned an invalid result: %s", exc)
+        return {"architecture_diagram": ""}
+    if result.get("ok"):
+        path = result.get("path", "")
+        files = list(state.get("output_files", []))
+        if path and path not in files:
+            files.append(path)
+        return {"architecture_diagram": path, "output_files": files}
+    logging.warning("Qwen architecture diagram unavailable: %s", result.get("error", "unknown error"))
     return {"architecture_diagram": ""}
 
 
@@ -2138,6 +2201,8 @@ Proposed Work, Results and Discussion, Conclusion and Future Work).
 - Do NOT change scientific content, facts, numbers, dataset/model names, metrics.
 - Preserve every equation, symbol, definition and equation number exactly.
 - Keep citation markers such as [SRC3] EXACTLY as they are.
+- In Proposed Work, keep each lettered method heading ("A. ...:", "B. ...:",
+  etc.) on its own line, with its body starting in the following paragraph.
 - Do not add claims, results, references, figures or tables.
 - Use the selected title if provided; keep existing keywords.
 - Only tidy paragraphs, whitespace and structure. If a section is fine, return it as is.
@@ -2149,6 +2214,21 @@ def _prefer(new: str, old: str) -> str:
     if new and len(new) >= 0.7 * len(old or ""):
         return new
     return old or new or ""
+
+
+def format_method_subsection_headings(text: str) -> str:
+    """Put inline lettered method headings on standalone lines."""
+    text = re.sub(
+        r"(?<!^)(?<!\n)[ \t]+(?P<heading>[A-Z]\.\s+[A-Z][^:\n]{2,100}:)[ \t]*",
+        r"\n\n\g<heading>\n\n",
+        text,
+    )
+    text = re.sub(
+        r"(?m)^(?P<heading>[A-Z]\.\s+[A-Z][^:\n]{2,100}:)[ \t]*(?=\S)",
+        r"\g<heading>\n\n",
+        text,
+    )
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
 
 
 def formatting_node(state: ResearchState) -> dict:
@@ -2171,6 +2251,7 @@ def formatting_node(state: ResearchState) -> dict:
     update: dict[str, Any] = {}
     for key in ["abstract"] + SECTION_KEYS:
         update[key] = _prefer(formatted.get(key, ""), state.get(key, ""))
+    update["proposed_work"] = format_method_subsection_headings(update["proposed_work"])
 
     titles = state.get("title_candidates", [])
     update["selected_title"] = (
@@ -2213,6 +2294,8 @@ def humanizer_node(state: ResearchState) -> dict:
             revised = humanize_text(original)
             # Guard against accidental truncation from remote inference.
             if revised.strip() and len(revised) >= 0.7 * len(original):
+                if key == "proposed_work":
+                    revised = format_method_subsection_headings(revised)
                 update[key] = revised
                 if revised != original:
                     changed.append(key)
@@ -2370,10 +2453,10 @@ def route_after_final_validation(state: ResearchState) -> str:
     if should_export:
         if (
             state.get("generate_architecture_diagram", False)
-            and os.getenv("NAPKIN_API_KEY", "").strip()
+            and os.getenv("QWEN_MODEL", "qwen2.5:3b-instruct").strip()
             and state.get("proposed_work", "").strip()
         ):
-            return "napkin_request"
+            return "architecture_diagram"
         return "document_export"
     return "revision"
 
@@ -2390,6 +2473,16 @@ def _author_entries(state: ResearchState) -> list[dict[str, Any]]:
         if fields and fields[0]:
             entries.append({"name": fields[0], "details": [part for part in fields[1:] if part]})
     return entries
+
+
+_DISPLAY_EQUATION_RE = re.compile(r"^(?P<formula>.+?)\s+\((?P<number>\d+)\)\s*$")
+
+
+def _display_equation_parts(text: str) -> tuple[str, str] | None:
+    match = _DISPLAY_EQUATION_RE.match(text.strip())
+    if match and "=" in match.group("formula") and len(match.group("formula")) <= 240:
+        return match.group("formula"), match.group("number")
+    return None
 
 
 def _latex_author_block(author: dict[str, Any], number: int) -> str:
@@ -2472,7 +2565,12 @@ def export_docx(state: ResearchState, output_dir: str) -> str:
         para(f"{number}. {title.upper()}", center=True, bold=True)
         for text_para in re.split(r"\n\s*\n", text):
             if text_para.strip():
-                para(text_para.strip())
+                equation = _display_equation_parts(text_para.strip())
+                equation_para = para(text_para.strip(), center=bool(equation))
+                if equation:
+                    equation_para.paragraph_format.keep_together = True
+                    for run in equation_para.runs:
+                        run.italic = True
         if title.lower() == "proposed work" and d["architecture_diagram"]:
             doc.add_picture(d["architecture_diagram"], width=Inches(3.4))
             para("Fig. 1. System architecture and component flow.", size=8)
@@ -2500,7 +2598,13 @@ def export_pdf(state: ResearchState, output_dir: str) -> str:
     story: list = []
 
     def block(text: str):
-        story.append(Paragraph(_pdf_escape(text).replace("\n", "<br/>"), styles["BodyText"]))
+        equation = _display_equation_parts(text.strip())
+        style = styles["BodyText"]
+        if equation:
+            style = style.clone("DisplayEquation")
+            style.alignment = TA_CENTER
+            style.fontName = "Times-Italic"
+        story.append(Paragraph(_pdf_escape(text).replace("\n", "<br/>"), style))
         story.append(Spacer(1, 8))
 
     if d["title"]:
@@ -2590,7 +2694,17 @@ def export_latex(state: ResearchState, output_dir: str) -> str:
     if d["index_terms"]:
         tex.append(f"\\begin{{IEEEkeywords}}\n{_tex(', '.join(d['index_terms']))}\n\\end{{IEEEkeywords}}")
     for _, title, text in d["sections"]:
-        tex.append(f"\\section{{{_tex(title)}}}\n\n{_tex(text)}")
+        paragraphs = []
+        for text_para in re.split(r"\n\s*\n", text):
+            if not text_para.strip():
+                continue
+            equation = _display_equation_parts(text_para.strip())
+            if equation:
+                formula, number = equation
+                paragraphs.append(f"\\begin{{equation}}\\text{{{_tex(formula)}}}\\tag{{{number}}}\\end{{equation}}")
+            else:
+                paragraphs.append(_tex(text_para.strip()).replace("\n", "\n\\\\\n"))
+        tex.append(f"\\section{{{_tex(title)}}}\n\n" + "\n\n".join(paragraphs))
         if title.lower() == "proposed work" and d["architecture_diagram"]:
             tex.append("\\begin{figure}[htbp]\\centering\\includegraphics[width=0.9\\linewidth]{architecture_diagram.png}\\caption{System architecture and component flow.}\\end{figure}")
         if title.lower() == "results and discussion" and d["results_chart"]:
@@ -2646,9 +2760,7 @@ graph.add_node("project_understanding", project_understanding_node, retry_policy
 graph.add_node("research_planner", research_planner_node, retry_policy=RETRY)
 graph.add_node("literature_research", literature_research_node, retry_policy=RETRY)
 graph.add_node("semantic_scholar", ToolNode([search_semantic_scholar]))
-graph.add_node("napkin_request", napkin_request_node)
-graph.add_node("napkin_tool", ToolNode([generate_napkin_visual]))
-graph.add_node("napkin_result", napkin_result_node)
+graph.add_node("architecture_diagram", architecture_diagram_node)
 graph.add_node("collect_literature", collect_literature_node)
 graph.add_node("paper_filtering", paper_filtering_node)
 graph.add_node("literature_analysis", literature_analysis_node, retry_policy=RETRY)
@@ -2658,6 +2770,7 @@ graph.add_node("paper_outline", paper_outline_node, retry_policy=RETRY)
 graph.add_node("outline_review", outline_review_node, retry_policy=RETRY)
 graph.add_node("human_approval", human_approval_node)
 graph.add_node("writer", writer_node, retry_policy=RETRY)
+graph.add_node("methodology_formulas", methodology_formulas_node)
 graph.add_node("citation_verification", citation_verification_node, retry_policy=RETRY)
 graph.add_node("claim_verification", claim_verification_node, retry_policy=RETRY)
 graph.add_node("consistency_verification", consistency_verification_node, retry_policy=RETRY)
@@ -2705,9 +2818,10 @@ graph.add_conditional_edges(
 graph.add_conditional_edges(
     "writer",
     route_after_writer,
-    {"writer": "writer", "citation_verification": "citation_verification"},
+    {"writer": "writer", "methodology_formulas": "methodology_formulas"},
 )
 
+graph.add_edge("methodology_formulas", "citation_verification")
 graph.add_edge("citation_verification", "claim_verification")
 graph.add_edge("claim_verification", "consistency_verification")
 graph.add_edge("consistency_verification", "review")
@@ -2724,18 +2838,12 @@ graph.add_conditional_edges(
     "final_validation",
     route_after_final_validation,
     {
-        "napkin_request": "napkin_request",
+        "architecture_diagram": "architecture_diagram",
         "document_export": "document_export",
         "revision": "revision",
     },
 )
-graph.add_conditional_edges(
-    "napkin_request",
-    route_after_napkin_request,
-    {"napkin_tool": "napkin_tool", "document_export": "document_export"},
-)
-graph.add_edge("napkin_tool", "napkin_result")
-graph.add_edge("napkin_result", "document_export")
+graph.add_edge("architecture_diagram", "document_export")
 graph.add_edge("document_export", END)
 
 app = graph.compile(checkpointer=InMemorySaver())

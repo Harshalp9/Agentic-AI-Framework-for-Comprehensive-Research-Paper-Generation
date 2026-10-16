@@ -116,6 +116,7 @@ STAGES = [
     ("results_and_discussion", "Results & Discussion", "✍️"),
     ("conclusion_and_future_work", "Conclusion & Future Work", "✍️"),
     ("abstract", "Abstract", "✍️"),
+    ("methodology_formulas", "Method formulas (Gemini)", "∑"),
     ("citation_verification", "Citations", "🔗"),
     ("claim_verification", "Claims", "✅"),
     ("consistency_verification", "Consistency", "🧩"),
@@ -124,7 +125,7 @@ STAGES = [
     ("formatting", "Format", "🎨"),
     ("humanizer", "Humanize", "✨"),
     ("final_validation", "Validate", "🛡️"),
-    ("napkin_request", "Architecture diagram", "🖼️"),
+    ("architecture_diagram", "Architecture diagram", "🖼️"),
     ("document_export", "Export", "📦"),
 ]
 STAGE_IDS = [s[0] for s in STAGES]
@@ -132,8 +133,6 @@ STAGE_IDS = [s[0] for s in STAGES]
 NODE_TO_STAGE = {
     "semantic_scholar": "literature_research",
     "collect_literature": "literature_research",
-    "napkin_tool": "napkin_request",
-    "napkin_result": "napkin_request",
 }
 STAY_ON_STAGE = {"literature_research", "semantic_scholar", "writer"}
 
@@ -159,9 +158,8 @@ NODE_LABELS = {
     "formatting": "Formatting",
     "humanizer": "Humanization",
     "final_validation": "Final validation",
-    "napkin_request": "Napkin diagram request",
-    "napkin_tool": "Napkin visual generation",
-    "napkin_result": "Napkin diagram result",
+    "methodology_formulas": "Gemini method analysis and formulas",
+    "architecture_diagram": "Local Qwen architecture diagram",
     "document_export": "Document export",
 }
 
@@ -289,6 +287,12 @@ def summarize(node: str, upd) -> str:
         if node == "writer":
             done = upd.get("completed_sections", [])
             return f"wrote **{done[-1]}**" if done else "writing..."
+        if node == "methodology_formulas":
+            result = next(
+                (item for item in upd.get("verification_results", []) if item.get("verification_type") == "method_formulas"),
+                {},
+            )
+            return f"{len(result.get('formulas_added', []))} formulas added; {result.get('status', 'done')}"
         if node == "paper_outline":
             t = upd.get("title_candidates", [])
             return f"{len(t)} title candidates, {len(upd.get('paper_outline', {}).get('sections', []))} sections"
@@ -355,11 +359,12 @@ def render_sidebar():
         st.markdown("**Models**")
         mistral_ok = bool(os.getenv("MISTRAL_API_KEY"))
         gemini_ok = getattr(paper, "gemini", None) is not None
-        napkin_ok = bool(os.getenv("NAPKIN_API_KEY"))
+        qwen_model = os.getenv("QWEN_MODEL", "qwen2.5:3b-instruct").strip()
+        ollama_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").strip()
         st.markdown(
             f"Mistral: {'<span class=pf-ok>key set</span>' if mistral_ok else '<span class=pf-bad>missing</span>'}<br>"
             f"Gemini: {'<span class=pf-ok>ready</span>' if gemini_ok else '<span class=pf-bad>not configured</span>'}<br>"
-            f"Napkin diagrams: {'<span class=pf-ok>ready</span>' if napkin_ok else '<span class=pf-bad>not configured</span>'}<br>"
+            f"Qwen diagrams: <span class=pf-ok>{qwen_model}</span> via Ollama<br>"
             f"Primary: <b>{getattr(paper, 'PRIMARY', 'mistral')}</b>",
             unsafe_allow_html=True,
         )
@@ -404,6 +409,8 @@ def render_header():
 
 
 def view_setup():
+    qwen_model = os.getenv("QWEN_MODEL", "qwen2.5:3b-instruct").strip()
+    ollama_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").strip()
     left, right = st.columns([3, 2], gap="large")
 
     with left:
@@ -441,16 +448,12 @@ def view_setup():
             accept_multiple_files=True,
             help="Each file becomes a named evidence source, e.g. metrics.csv -> 'metrics'.",
         )
-        napkin_configured = bool(os.getenv("NAPKIN_API_KEY", "").strip())
         generate_diagram = st.checkbox(
-            "Generate architecture diagram with Napkin",
-            value=napkin_configured,
-            disabled=not napkin_configured,
+            "Generate architecture diagram with local Qwen (Ollama)",
+            value=True,
             help=(
-                "When enabled, Napkin creates a diagram from the Proposed Work section "
-                "after final validation."
-                if napkin_configured
-                else "Set NAPKIN_API_KEY to enable Napkin diagram generation."
+                f"After final validation, {qwen_model} at {ollama_url} extracts the described components; "
+                "PaperForge renders them in a consistent diagram style. Start Ollama and pull the model first."
             ),
         )
         with st.expander("Advanced: paste results as JSON"):

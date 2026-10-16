@@ -7,6 +7,7 @@ PaperForge AI is a Streamlit application that helps turn a research project desc
 - Multi-stage research and writing workflow with visible progress.
 - Semantic Scholar literature search and source metadata collection.
 - Human review and approval of the proposed outline before drafting.
+- Gemini method analysis that adds numbered, evidence-supported formulas to Proposed Work.
 - Citation, claim, consistency, and manuscript validation checks.
 - Optional GoHumanize polishing between formatting and final validation.
 - Optional project files and experimental CSV/JSON data as evidence.
@@ -31,7 +32,7 @@ python -m pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-Create a `.env` file in the project root and add your provider keys:
+Create a `.env` file in the project root and add your provider keys. Gemini is needed for the Proposed Work method-analysis and formula node:
 
 ```dotenv
 MISTRAL_API_KEY=your_mistral_api_key
@@ -48,12 +49,15 @@ GOHUMANIZE_SPACE_ID=your-username/gohumanize-demo
 # Only needed if the Space is private
 HF_TOKEN=your_hugging_face_token
 
-# Optional Napkin AI architecture diagrams
-NAPKIN_API_KEY=your_napkin_api_token
+# Optional local Qwen architecture diagrams (Ollama)
+OLLAMA_BASE_URL=http://localhost:11434
+QWEN_MODEL=qwen2.5:3b-instruct
 ```
 
 Keep `.env` private and do not commit API keys. `PRIMARY_LLM` can be set to `gemini` when `GOOGLE_API_KEY` is configured. Gemini is optional; Mistral is the default provider.
-When configured, the project form lets you opt in to Napkin architecture diagrams. If enabled, the workflow calls Napkin after final validation and before document export, using only the Proposed Work section. If Napkin is unavailable or does not return a visual, document export continues without the diagram. Add verified numeric results and baselines to the supplied results JSON/CSV for comparison tables and charts; unsupported metrics are never fabricated.
+The project form lets you opt in to a local Qwen architecture diagram. Install and start Ollama, then pull the model configured by `QWEN_MODEL` (for example, `ollama pull qwen2.5:3b-instruct`). After final validation and before document export, the workflow sends only the Proposed Work section to Ollama. Qwen extracts a constrained component-and-connection description; PaperForge renders it in a consistent publication-style layout and inserts it in the Proposed Work section. If Ollama is unavailable or the response cannot be rendered, document export continues without the diagram. Add verified numeric results and baselines to the supplied results JSON/CSV for comparison tables and charts; unsupported metrics are never fabricated.
+
+After the Writer completes the paper, a Gemini node reviews only the Proposed Work method alongside confirmed project facts. It adds a numbered equation and a following “where” definition when a formula is supported and useful. It preserves the original section text and citations; if Gemini is not configured or cannot preserve the text, the section remains unchanged. The node runs before citation, claim, consistency and academic review so later checks can review its additions. Display equations are centered in DOCX/PDF and emitted as equation blocks in LaTeX.
 
 To enable final-paper humanization, set `GOHUMANIZE_SPACE_ID` to the Hugging Face owner/Space name for your Gradio Space. `HF_TOKEN` is only required for a private Space. The humanizer runs on the abstract and paper sections after formatting, sends text in requests of at most 5,000 characters, and keeps citations, equations, URLs, and code blocks intact. References are not sent to the service. If the Space is not configured or a request fails, the workflow retains the formatted text and continues to final validation. The Space's free ZeroGPU quota can limit availability; without a Space ID, humanization is skipped.
 
@@ -87,7 +91,8 @@ The application reads environment variables from `.env`:
 | `GOOGLE_API_KEY` | Enables Gemini support and fallback | Not set |
 | `PRIMARY_LLM` | Selects the primary structured-output provider (`mistral` or `gemini`) | `mistral` |
 | `SEMANTIC_SCHOLAR_API_KEY` | Authenticates Semantic Scholar search requests | Not set |
-| `NAPKIN_API_KEY` | Enables Napkin AI architecture diagram generation | Not set |
+| `OLLAMA_BASE_URL` | Local Ollama API endpoint for Qwen diagrams | `http://localhost:11434` |
+| `QWEN_MODEL` | Ollama model tag for architecture diagram extraction | `qwen2.5:3b-instruct` |
 | `GOHUMANIZE_SPACE_ID` | Enables GoHumanize via a Hugging Face Gradio Space | Not set |
 | `HF_TOKEN` | Authenticates access to a private Hugging Face Space | Not set |
 | `MAX_REVISIONS` | Maximum automated revision cycles | `2` |
@@ -102,6 +107,6 @@ The maximum revision cycles can also be adjusted in the app sidebar.
 
 - `app.py` - Streamlit interface and workflow controls.
 - `paper.py` - LangGraph research, writing, verification, and export workflow.
-- `tools.py` - Semantic Scholar search tool, Napkin ai tool.
+- `tools.py` - Semantic Scholar search and local Qwen diagram generation.
 - `requirements.txt` - Python dependencies.
 - `.streamlit/config.toml` - Streamlit theme and server configuration.
